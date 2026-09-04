@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Offline TOTP/HOTP authenticator"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Offline authenticator"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Authenticator"
+    }
+  ]
+}
