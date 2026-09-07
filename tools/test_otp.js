@@ -1,5 +1,5 @@
 // 用 RFC 4226/6238 官方测试向量验证 OTP 实现。
-// 做法：把 ArkTS 源码做最小转换（去 import、enum→const 对象、去掉 private/readonly 修饰符）
+// 做法：把 ArkTS 源码做最小转换（保留相对 import、enum→const 对象、去掉 private/readonly 修饰符）
 // 复制为 .ts，再以 Node 原生 type-stripping 导入执行，保证被测代码与工程内代码逐行一致。
 const fs = require('fs');
 const path = require('path');
@@ -11,12 +11,13 @@ const root = path.join(__dirname, '..', 'entry/src/main/ets');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'otp-test-'));
 
 function transform(src) {
-  // 保留同目录相对导入（补 .ts 扩展名），丢弃其它（模型/UI 依赖测试中不会执行）
-  src = src.replace(/^import \{([^}]*)\} from '\.\/(\w+)';$/gm,
-    (m, names, file) => `import {${names} } from './${file}.ts';`);
-  src = src.replace(/^import (?!.*'\.\/\w+\.ts';).*$/gm, '');
-  src = src.replace(/export enum HashAlg \{[\s\S]*?\}/,
-    `export const HashAlg = { SHA1: 'SHA1', SHA256: 'SHA256' };\nexport type HashAlgT = string;`);
+  // Preserve actual model and OTP imports; interfaces have no runtime export.
+  src = src.replace(/^import \{([^}]*)\} from '(\.[^']+)';$/gm,
+    (m, names, file) => `import { ${names.split(',').map(n => n.trim())
+      .map(n => n === 'AccountInfo' ? `type ${n}` : n).join(', ')} } from '${file}.ts';`);
+  // Node type-stripping does not support enums; retain each source enum's values.
+  src = src.replace(/export enum (\w+) \{([\s\S]*?)\}/g,
+    (m, name, members) => `export const ${name} = {${members.replace(/=/g, ':')}};`);
   src = src.replace(/\bprivate\s+/g, '');
   src = src.replace(/\breadonly\s+/g, '');
   return src;
@@ -24,7 +25,8 @@ function transform(src) {
 
 function prepare(file) {
   const src = transform(fs.readFileSync(path.join(root, file), 'utf8'));
-  const out = path.join(tmp, path.basename(file).replace('.ets', '.ts'));
+  const out = path.join(tmp, file.replace('.ets', '.ts'));
+  fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, src);
   return out;
 }
@@ -33,10 +35,14 @@ async function main() {
   const digestUrl = pathToFileURL(prepare('otp/Digest.ets')).href;
   const base32Url = pathToFileURL(prepare('otp/Base32.ets')).href;
   const engineUrl = pathToFileURL(prepare('otp/OtpEngine.ets')).href;
-  const { Digest, Hmac } = await import(digestUrl);
+  const accountUrl = pathToFileURL(prepare('model/Account.ets')).href;
+  const uriUrl = pathToFileURL(prepare('otp/OtpUri.ets')).href;
+  const { OtpType, cloneAccount } = await import(accountUrl);
+  const { OtpUri } = await import(uriUrl);
+  const { Digest, Hmac, HashAlg } = await import(digestUrl);
   const { Base32String } = await import(base32Url);
   const { OtpEngine } = await import(engineUrl);
-  const HashAlg = { SHA1: 'SHA1', SHA256: 'SHA256' };
+  const makeAccount = (type = OtpType.TOTP) => ({ id: 1, name: 'alice@example.com', issuer: 'Example', secret: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', type, counter: 0, digits: 6, algorithm: 'SHA1', period: 30, createdAt: 0, sortOrder: 0 });
 
   let failures = 0;
   const check = (name, ok, detail = '') => {
@@ -125,12 +131,90 @@ async function main() {
   check('[状态编码] 64 位大端(state>2^32) 与 crypto 一致', bigMine === bigRef);
   console.log(`  (交叉对照 bigState=${bigState})`);
 
-  fs.rmSync(tmp, { recursive: true, force: true });
+  // Exercise wrappers using the real Account module and hashAlgOf mapping.
+  for (let counter = 0; counter < hotpExpected.length; counter++) {
+    check(`[HOTP wrapper] counter=${counter}`, OtpEngine.hotp({ ...makeAccount(OtpType.HOTP), counter }) === hotpExpected[counter]);
+  }
+  const sha256Expected = ['46119246', '68084774', '67062674', '91819424', '90698825', '77737706'];
+  for (const [i, [time, expected]] of totpVectors.entries()) {
+    const account = { ...makeAccount(), digits: 8 };
+    check(`[TOTP SHA1 wrapper] ${time}`, OtpEngine.totp(cloneAccount(account), time * 1000) === expected);
+    account.algorithm = 'SHA256';
+    account.secret = Base32String.encode(Buffer.from('12345678901234567890123456789012'));
+    check(`[TOTP SHA256 RFC6238] ${time}`, OtpEngine.totp(account, time * 1000) === sha256Expected[i]);
+  }
+  const invalidFields = {
+    secret: ['', 'A', '====', 'INVALID!'], type: [-1, 2, 'TOTP'],
+    digits: [0, 10, 6.5, NaN, Infinity, '6'], algorithm: ['', 'SHA512', 'sha1'],
+    period: [0, 3601, 1.5, NaN, Infinity, '30'],
+    counter: [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '0']
+  };
+  for (const [field, values] of Object.entries(invalidFields)) {
+    for (const value of values) {
+      const account = { ...makeAccount(), [field]: value };
+      check(`[invalid account] ${field}=${String(value)}`, !OtpEngine.isValidParameters(account)
+        && OtpEngine.totp(account, 59000) === '' && OtpEngine.hotp(account) === '');
+    }
+  }
+  for (const state of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    check(`[invalid state] ${state}`, OtpEngine.computeCode(secretBytes, HashAlg.SHA1, 6, state) === '');
+  }
+  for (const digits of [0, 10, 1.5, NaN, Infinity]) {
+    check(`[invalid digits] ${digits}`, OtpEngine.computeCode(secretBytes, HashAlg.SHA1, digits, 0) === '');
+  }
+  check('[invalid engine algorithm/secret]', OtpEngine.computeCode(secretBytes, 'SHA512', 6, 0) === ''
+    && OtpEngine.computeCode(new Uint8Array(), HashAlg.SHA1, 6, 0) === '');
+  for (const now of [-1, NaN, Infinity, Number.MAX_VALUE]) {
+    check(`[invalid time] ${now}`, OtpEngine.totp(makeAccount(), now) === '');
+  }
+  for (const digits of [1, 9]) {
+    for (const period of [1, 3600]) {
+      const account = { ...makeAccount(), digits, period, counter: Number.MAX_SAFE_INTEGER };
+      check(`[valid bounds] ${digits}/${period}`, OtpEngine.isValidParameters(account)
+        && new RegExp(`^[0-9]{${digits}}$`).test(OtpEngine.hotp(account)));
+    }
+  }
+  const baseUri = 'otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP';
+  check('[URI defaults]', OtpUri.parse(baseUri).ok && OtpUri.parse(baseUri).period === 30);
+  const badQueries = ['secret=', 'secret=A', 'secret=INVALID!', 'algorithm=', 'algorithm=SHA512', 'algorithm=MD5',
+    'issuer=Other', 'issuer=', 'issuer=%ZZ', 'unknown=%ZZ', 'se%ZZcret=x',
+    'digits=6&digits=6', 'DIGITS=6&%64igits=8', 'issuer=Example&issuer=Example',
+    'algorithm=SHA1&algorithm=SHA256', 'period=30&period=30', 'counter=0&counter=1'];
+  for (const field of ['digits', 'period', 'counter']) {
+    for (const value of ['', '-1', '1.5', '1e2', '0x10', '%201', '1%20', '%2B1', 'NaN', 'Infinity', '9007199254740992']) {
+      badQueries.push(`${field}=${value}`);
+    }
+  }
+  badQueries.push('digits=0', 'digits=10', 'period=0', 'period=3601', 'digits');
+  for (const query of badQueries) {
+    const parsed = OtpUri.parse(`${baseUri}&${query}`);
+    check(`[URI rejects] ${query}`, !parsed.ok && parsed.error.length > 0);
+  }
+  for (const uri of ['otpauth://totp/a?secret=A', 'otpauth://totp/a?secret=INVALID!',
+    'otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP', 'otpauth://totp/%ZZ?secret=JBSWY3DPEHPK3PXP',
+    'otpauth://totp/a', 'otpauth://other/a?secret=MY', 'https://totp/a?secret=MY']) {
+    check(`[URI invalid] ${uri}`, !OtpUri.parse(uri).ok);
+  }
+  for (const type of [OtpType.TOTP, OtpType.HOTP]) {
+    for (const digits of [1, 9]) {
+      const account = { ...makeAccount(type), name: '爱丽丝 + & / %', issuer: '示例 & + %',
+        secret: 'MY======', algorithm: 'SHA256', digits, period: 3600, counter: Number.MAX_SAFE_INTEGER };
+      const uri = OtpUri.build(account);
+      const parsed = OtpUri.parse(uri);
+      check(`[URI roundtrip] type=${type} digits=${digits}`, uri.includes('secret=MY%3D%3D%3D%3D%3D%3D')
+        && parsed.ok && ['name', 'issuer', 'secret', 'algorithm', 'digits', 'type', type === OtpType.TOTP ? 'period' : 'counter']
+          .every(field => parsed[field] === account[field]));
+    }
+  }
+  check('[URI decimal boundaries]', OtpUri.parse(`${baseUri}&digits=01&period=1&counter=9007199254740991`).ok);
+  check('[URI case and encoded keys]', OtpUri.parse('OTPAUTH://TOTP/a?%73ecret=MY&algorithm=sha256').ok);
   console.log(failures === 0 ? '\n=== ALL TESTS PASSED ===' : `\n=== ${failures} FAILURES ===`);
-  process.exit(failures === 0 ? 0 : 1);
+  process.exitCode = failures === 0 ? 0 : 1;
 }
 
 main().catch((e) => {
   console.error(e);
-  process.exit(1);
+  process.exitCode = 1;
+}).finally(() => {
+  fs.rmSync(tmp, { recursive: true, force: true });
 });

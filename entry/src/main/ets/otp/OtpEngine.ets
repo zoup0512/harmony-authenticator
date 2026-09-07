@@ -1,6 +1,6 @@
 import { Hmac, HashAlg } from './Digest';
 import { Base32String } from './Base32';
-import { AccountInfo, hashAlgOf } from '../model/Account';
+import { AccountInfo, OtpType, hashAlgOf } from '../model/Account';
 
 /**
  * OTP 计算引擎，移植自 Android 版 Google Authenticator 的
@@ -15,6 +15,11 @@ export class OtpEngine {
    * RFC 4226：给定状态（HOTP 计数器或 TOTP 时间片）计算验证码。
    */
   static computeCode(secretBytes: Uint8Array, alg: HashAlg, digits: number, state: number): string {
+    if (secretBytes.length === 0 || (alg !== HashAlg.SHA1 && alg !== HashAlg.SHA256)
+      || !Number.isInteger(digits) || digits < 1 || digits > 9
+      || !Number.isSafeInteger(state) || state < 0) {
+      return '';
+    }
     // 8 字节大端状态
     const msg = new Uint8Array(8);
     const dv = new DataView(msg.buffer);
@@ -46,6 +51,17 @@ export class OtpEngine {
     return Math.floor(Math.floor(nowMillis / 1000) / period);
   }
 
+  static isValidParameters(account: AccountInfo): boolean {
+    if (!account || (account.type !== OtpType.TOTP && account.type !== OtpType.HOTP)
+      || !Number.isInteger(account.digits) || account.digits < 1 || account.digits > 9
+      || (account.algorithm !== 'SHA1' && account.algorithm !== 'SHA256')
+      || !Number.isInteger(account.period) || account.period < 1 || account.period > 3600
+      || !Number.isSafeInteger(account.counter) || account.counter < 0) {
+      return false;
+    }
+    return OtpEngine.isValidSecret(account.secret);
+  }
+
   /** 校验密钥是否合法（能被 Base32 解码） */
   static isValidSecret(secret: string): boolean {
     try {
@@ -57,7 +73,9 @@ export class OtpEngine {
 
   /** 计算 TOTP 当前验证码；密钥非法时返回空串 */
   static totp(account: AccountInfo, nowMillis: number): string {
+    if (!Number.isFinite(nowMillis) || nowMillis < 0) return '';
     try {
+      if (!OtpEngine.isValidParameters(account)) return '';
       const secretBytes = Base32String.decode(account.secret);
       const state = OtpEngine.timeSlice(nowMillis, account.period);
       return OtpEngine.computeCode(secretBytes, hashAlgOf(account), account.digits, state);
@@ -69,6 +87,7 @@ export class OtpEngine {
   /** 计算 HOTP 当前计数器对应的验证码 */
   static hotp(account: AccountInfo): string {
     try {
+      if (!OtpEngine.isValidParameters(account)) return '';
       const secretBytes = Base32String.decode(account.secret);
       return OtpEngine.computeCode(secretBytes, hashAlgOf(account), account.digits, account.counter);
     } catch (e) {

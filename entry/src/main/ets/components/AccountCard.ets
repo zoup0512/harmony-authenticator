@@ -3,15 +3,27 @@ import { Palette, Theme } from '../common/Theme';
 import { CountdownRing } from './CountdownRing';
 import { promptAction } from '@kit.ArkUI';
 
+/** 稳定列表键复用卡片时，原位更新同一个可观察对象，避免捕获过期快照。 */
+@Observed
+export class CardVm {
+  account: AccountInfo;
+  code: string;
+  remainMs: number;
+
+  constructor(account: AccountInfo, code: string, remainMs: number) {
+    this.account = account;
+    this.code = code;
+    this.remainMs = remainMs;
+  }
+}
+
 /**
  * 账户卡片：头像 + 名称 + 大号验证码 + 倒计时环（TOTP）/ 下一个码按钮（HOTP）。
  * 点击卡片复制验证码；长按弹出操作菜单。
  */
 @Component
 export struct AccountCard {
-  @Prop account: AccountInfo;
-  @Prop code: string;
-  @Prop remainMs: number = 30000;
+  @ObjectLink vm: CardVm;
   @Prop copiedTick: number = 0;
   @StorageProp(Theme.KEY_DARK_MODE) private isDark: boolean = false;
   onCopy: (account: AccountInfo, code: string) => void = () => {};
@@ -36,7 +48,7 @@ export struct AccountCard {
               .layoutWeight(1)
           }
         }
-        Text(this.account.name)
+        Text(this.vm.account.name)
           .fontSize(12)
           .fontColor(this.pal().onSurfaceVariant)
           .maxLines(1)
@@ -48,24 +60,24 @@ export struct AccountCard {
 
       Column({ space: 4 }) {
         Text(this.formattedCode())
-          .fontSize(this.account.digits > 6 ? 24 : 28)
+          .fontSize(this.vm.account.digits > 6 ? 24 : 28)
           .fontWeight(FontWeight.Bold)
           .fontColor(this.isCopied() ? this.pal().primary : this.pal().onSurface)
-          .letterSpacing(this.account.digits > 6 ? 1 : 2)
+          .letterSpacing(this.vm.account.digits > 6 ? 1 : 2)
           .fontFamily('monospace')
           .maxLines(1)
-        if (this.account.type === OtpType.HOTP) {
-          Text(`计数器 ${this.account.counter}`)
+        if (this.vm.account.type === OtpType.HOTP) {
+          Text(`计数器 ${this.vm.account.counter}`)
             .fontSize(10)
             .fontColor(this.pal().onSurfaceVariant)
         }
       }
       .alignItems(HorizontalAlign.End)
 
-      if (this.account.type === OtpType.TOTP) {
+      if (this.vm.account.type === OtpType.TOTP) {
         CountdownRing({
-          remainMs: this.remainMs,
-          periodMs: this.account.period * 1000,
+          remainMs: this.vm.remainMs,
+          periodMs: this.vm.account.period * 1000,
           color: this.pal().primary,
           warnColor: this.pal().error,
           trackColor: this.pal().surfaceContainerHighest,
@@ -84,7 +96,7 @@ export struct AccountCard {
         .borderRadius(20)
         .backgroundColor(this.pal().primaryContainer)
         .onClick((event: ClickEvent) => {
-          this.onNextCode(this.account);
+          this.onNextCode(this.vm.account);
         })
       }
     }
@@ -93,8 +105,8 @@ export struct AccountCard {
     .borderRadius(16)
     .backgroundColor(this.pal().surfaceContainerHigh)
     .onClick(() => {
-      if (this.code.length > 0) {
-        this.onCopy(this.account, this.code);
+      if (this.vm.code.length > 0) {
+        this.onCopy(this.vm.account, this.vm.code);
       }
     })
     .gesture(
@@ -114,7 +126,7 @@ export struct AccountCard {
       .height(44)
       .borderRadius(22)
       .textAlign(TextAlign.Center)
-      .backgroundColor(Theme.avatarColor(this.account.issuer + '|' + this.account.name, this.isDark))
+      .backgroundColor(Theme.avatarColor(this.vm.account.issuer + '|' + this.vm.account.name, this.isDark))
   }
 
   private pal(): Palette {
@@ -122,18 +134,18 @@ export struct AccountCard {
   }
 
   private displayIssuer(): string {
-    return this.account.issuer.length > 0 ? this.account.issuer : this.account.name;
+    return this.vm.account.issuer.length > 0 ? this.vm.account.issuer : this.vm.account.name;
   }
 
   private avatarLetter(): string {
-    const src = this.account.issuer.length > 0 ? this.account.issuer : this.account.name;
+    const src = this.vm.account.issuer.length > 0 ? this.vm.account.issuer : this.vm.account.name;
     const trimmed = src.trim();
     return trimmed.length > 0 ? trimmed.charAt(0).toUpperCase() : '?';
   }
 
   /** 6 位码显示为 "123 456"，8 位码 "1234 5678" */
   private formattedCode(): string {
-    const c = this.code.length > 0 ? this.code : '------';
+    const c = this.vm.code.length > 0 ? this.vm.code : '------';
     const half = Math.floor(c.length / 2);
     return `${c.substring(0, half)} ${c.substring(half)}`;
   }
@@ -155,15 +167,15 @@ export struct AccountCard {
       ]
     }).then((res: promptAction.ActionMenuSuccessResponse) => {
       if (res.index === 0) {
-        this.onCopy(this.account, this.code);
+        this.onCopy(this.vm.account, this.vm.code);
       } else if (res.index === 1) {
-        this.onMoveUp(this.account);
+        this.onMoveUp(this.vm.account);
       } else if (res.index === 2) {
-        this.onMoveDown(this.account);
+        this.onMoveDown(this.vm.account);
       } else if (res.index === 3) {
-        this.onRename(this.account);
+        this.onRename(this.vm.account);
       } else if (res.index === 4) {
-        this.onDelete(this.account);
+        this.onDelete(this.vm.account);
       }
     }).catch(() => {
       // 用户取消或弹窗失败时静默

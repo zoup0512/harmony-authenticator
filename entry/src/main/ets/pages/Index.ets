@@ -3,14 +3,18 @@ import { AccountInfo, OtpType } from '../model/Account';
 import { OtpEngine } from '../otp/OtpEngine';
 import { Theme, Palette } from '../common/Theme';
 import { ClipboardUtil } from '../common/ClipboardUtil';
-import { AccountCard } from '../components/AccountCard';
+import { AccountCard, CardVm } from '../components/AccountCard';
 import { EmptyView } from '../components/EmptyView';
 
-/** 列表条目的视图模型 */
-interface CardVm {
-  account: AccountInfo;
+/** 每个账户仅保留当前状态的验证码，不依赖防御性副本的对象身份。 */
+interface CodeCacheEntry {
+  secret: string;
+  algorithm: string;
+  digits: number;
+  type: OtpType;
+  period: number;
+  state: number;
   code: string;
-  remainMs: number;
 }
 
 /** 重命名对话框 */
@@ -101,15 +105,21 @@ struct Index {
   @State vms: CardVm[] = [];
   @State copiedId: number = -1;
   @State ready: boolean = false;
+  @State loadFailed: boolean = false;
+  @State now: number = Date.now();
   private store: AccountStore = AccountStore.getInstance();
+  private accounts: AccountInfo[] = [];
+  private codeCache: Map<number, CodeCacheEntry> = new Map<number, CodeCacheEntry>();
   private timerId: number = -1;
+  private copiedTimeoutToken: number = 0;
+  private copiedTimerId: number = -1;
   private unsubscribe: (() => void) | null = null;
   private renameTarget: AccountInfo | undefined = undefined;
   private renameDialog: CustomDialogController = new CustomDialogController({
     builder: RenameDialog({
       onConfirm: (issuer: string, name: string) => {
         if (this.renameTarget !== undefined) {
-          this.store.renameAccount(this.renameTarget.id, name, issuer);
+          this.renameAccount(this.renameTarget.id, name, issuer);
         }
       }
     }),
@@ -118,36 +128,70 @@ struct Index {
   });
 
   aboutToAppear(): void {
-    this.ready = this.store.isLoaded();
-    this.rebuild();
-    this.unsubscribe = this.store.subscribe(() => {
-      this.rebuild();
-    });
-    this.timerId = setInterval(() => {
-      this.rebuild();
-    }, 250);
+    if (this.unsubscribe === null) {
+      this.unsubscribe = this.store.subscribe(() => {
+        this.refreshAccounts();
+      });
+    }
+    this.refreshAccounts();
   }
 
   aboutToDisappear(): void {
-    if (this.timerId >= 0) {
-      clearInterval(this.timerId);
-      this.timerId = -1;
-    }
+    this.stopTimer();
+    this.clearCopied();
     if (this.unsubscribe !== null) {
       this.unsubscribe();
       this.unsubscribe = null;
     }
+    this.codeCache.clear();
   }
 
   onPageShow(): void {
-    this.rebuild();
+    this.refreshAccounts();
+    this.startTimer();
+  }
+
+  onPageHide(): void {
+    this.stopTimer();
+    this.clearCopied();
+  }
+
+  private startTimer(): void {
+    if (this.timerId >= 0) {
+      return;
+    }
+    this.timerId = setInterval(() => {
+      this.now = Date.now();
+      this.rebuild();
+    }, 250);
+  }
+
+  private stopTimer(): void {
+    if (this.timerId >= 0) {
+      clearInterval(this.timerId);
+      this.timerId = -1;
+    }
+  }
+
+  private clearCopied(): void {
+    if (this.copiedTimerId >= 0) {
+      clearTimeout(this.copiedTimerId);
+      this.copiedTimerId = -1;
+    }
+    this.copiedTimeoutToken++;
+    this.copiedId = -1;
   }
 
   build() {
     Column() {
       this.TitleBar()
       Stack({ alignContent: Alignment.BottomEnd }) {
-        if (this.vms.length === 0) {
+        if (this.loadFailed) {
+          EmptyView({
+            title: '账户加载失败',
+            subtitle: '无法读取账户，请重启应用后重试'
+          })
+        } else if (this.vms.length === 0) {
           EmptyView({
             title: this.ready ? '暂无账户' : '正在加载…',
             subtitle: this.ready ? '点击右下角按钮添加第一个验证账户' : ''
@@ -157,10 +201,8 @@ struct Index {
             ForEach(this.vms, (vm: CardVm) => {
               ListItem() {
                 AccountCard({
-                  account: vm.account,
-                  code: vm.code,
-                  remainMs: vm.remainMs,
-                  copiedTick: this.copiedId === vm.account.id ? Date.now() : 0,
+                  vm: vm,
+                  copiedTick: this.copiedId === vm.account.id ? 1 : 0,
                   onCopy: (account: AccountInfo, code: string) => {
                     this.onCopyCode(account, code);
                   },
@@ -174,17 +216,17 @@ struct Index {
                     this.onDelete(account);
                   },
                   onMoveUp: (account: AccountInfo) => {
-                    this.store.moveAccount(account.id, -1);
+                    this.moveAccount(account.id, -1);
                   },
                   onMoveDown: (account: AccountInfo) => {
-                    this.store.moveAccount(account.id, 1);
+                    this.moveAccount(account.id, 1);
                   }
                 })
               }
             }, (vm: CardVm) => `acct-${vm.account.id}`)
           }
           .width('100%')
-          .layoutWeight(1)
+          .height('100%')
           .padding({ left: 16, right: 16, top: 6, bottom: 96 })
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
@@ -226,18 +268,13 @@ struct Index {
 
   @Builder Fab() {
     Button() {
-      Row({ space: 8 }) {
-        Image($r('sys.media.ohos_ic_public_add'))
-          .width(22)
-          .height(22)
-          .fillColor(this.pal().onPrimary)
-        Text('添加账户')
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.pal().onPrimary)
-      }
-      .padding({ left: 18, right: 22 })
+      Image($r('sys.media.ohos_ic_public_add'))
+        .width(24)
+        .height(24)
+        .fillColor(this.pal().onPrimary)
     }
+    .accessibilityText('添加账户')
+    .width(56)
     .height(56)
     .borderRadius(28)
     .backgroundColor(this.pal().primary)
@@ -257,36 +294,100 @@ struct Index {
     return Theme.palette(this.isDark);
   }
 
-  /** 每 0.25s 重建视图模型：重算验证码与剩余时间（纯计算，开销可忽略） */
-  private rebuild(): void {
-    const now = Date.now();
-    const accounts = this.store.getAccounts().slice()
+  /** 仅在进入页面或存储通知时获取、排序账户副本并使缓存失效。 */
+  private refreshAccounts(): void {
+    this.accounts = this.store.getAccounts()
       .sort((a: AccountInfo, b: AccountInfo) => a.sortOrder - b.sortOrder);
+    this.codeCache.clear();
+    this.ready = this.store.isLoaded();
+    this.loadFailed = this.store.getLoadError().length > 0;
+    this.now = Date.now();
+    this.rebuild();
+  }
+
+  private cachedCode(account: AccountInfo, now: number): string {
+    const state = account.type === OtpType.TOTP ?
+      OtpEngine.timeSlice(now, account.period) : account.counter;
+    const cached = this.codeCache.get(account.id);
+    if (cached !== undefined && cached.secret === account.secret &&
+      cached.algorithm === account.algorithm && cached.digits === account.digits &&
+      cached.type === account.type && cached.period === account.period && cached.state === state) {
+      return cached.code;
+    }
+    const code = account.type === OtpType.TOTP ?
+      OtpEngine.totp(account, now) : OtpEngine.hotp(account);
+    this.codeCache.set(account.id, {
+      secret: account.secret,
+      algorithm: account.algorithm,
+      digits: account.digits,
+      type: account.type,
+      period: account.period,
+      state: state,
+      code: code
+    });
+    return code;
+  }
+
+  /** 250ms 更新倒计时；仅缓存失效或 OTP 状态变化时解码和计算 HMAC。 */
+  private rebuild(): void {
+    const now = this.now;
+    const existing: Map<number, CardVm> = new Map<number, CardVm>();
+    for (const vm of this.vms) {
+      existing.set(vm.account.id, vm);
+    }
     const next: CardVm[] = [];
-    for (const a of accounts) {
-      const vm: CardVm = {
-        account: a,
-        code: a.type === OtpType.TOTP ? OtpEngine.totp(a, now) : OtpEngine.hotp(a),
-        remainMs: a.type === OtpType.TOTP ? OtpEngine.remainingMillis(now, a.period) : 0
-      };
+    for (const a of this.accounts) {
+      const code = this.cachedCode(a, now);
+      const remainMs = a.type === OtpType.TOTP ? OtpEngine.remainingMillis(now, a.period) : 0;
+      let vm = existing.get(a.id);
+      if (vm === undefined) {
+        vm = new CardVm(a, code, remainMs);
+      } else {
+        // ForEach 的稳定 key 不会重新执行已有条目的 builder，必须更新原对象。
+        vm.account = a;
+        vm.code = code;
+        vm.remainMs = remainMs;
+      }
       next.push(vm);
     }
     this.vms = next;
-    this.ready = this.store.isLoaded();
   }
 
   private onCopyCode(account: AccountInfo, code: string): void {
     ClipboardUtil.copyText(this.getUIContext(), code, '验证码已复制');
+    this.clearCopied();
     this.copiedId = account.id;
-    setTimeout(() => {
-      if (this.copiedId === account.id) {
+    const token = ++this.copiedTimeoutToken;
+    this.copiedTimerId = setTimeout(() => {
+      this.copiedTimerId = -1;
+      if (this.copiedTimeoutToken === token && this.copiedId === account.id) {
         this.copiedId = -1;
       }
     }, 1500);
   }
 
+  private showFailure(): void {
+    this.getUIContext().getPromptAction().showToast({ message: '操作失败，请稍后重试' });
+  }
+
   private onNextCode(account: AccountInfo): void {
-    this.store.incrementCounter(account.id);
+    this.store.incrementCounter(account.id).then((counter: number) => {
+      if (counter < 0) {
+        this.showFailure();
+      }
+    }).catch(() => this.showFailure());
+  }
+
+  private moveAccount(id: number, offset: number): void {
+    this.store.moveAccount(id, offset).catch(() => this.showFailure());
+  }
+
+  private renameAccount(id: number, name: string, issuer: string): void {
+    this.store.renameAccount(id, name, issuer).then((renamed: boolean) => {
+      if (!renamed) {
+        this.showFailure();
+      }
+    }).catch(() => this.showFailure());
   }
 
   private onRename(account: AccountInfo): void {
@@ -295,7 +396,7 @@ struct Index {
       builder: RenameDialog({
         account: account,
         onConfirm: (issuer: string, name: string) => {
-          this.store.renameAccount(account.id, name, issuer);
+          this.renameAccount(account.id, name, issuer);
         }
       }),
       autoCancel: true,
@@ -316,7 +417,7 @@ struct Index {
         value: '删除',
         fontColor: this.pal().error,
         action: () => {
-          this.store.deleteAccount(account.id);
+          this.store.deleteAccount(account.id).catch(() => this.showFailure());
         }
       },
       cancel: () => {}

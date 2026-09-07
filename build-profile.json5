@@ -1,10 +1,24 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\vyron\\.ohos\\config\\default_harmony-authenticator_xbIiNH7eKHCedzKhg3xquQAE3SY6BGXoqC6dQCQTSNc=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B07955BF3F796F38408C93139FA0A56BDA082209BF8A5E1600EA43C80F78C9BCC80E5DB75EC597B",
+          "profile": "C:\\Users\\vyron\\.ohos\\config\\default_harmony-authenticator_xbIiNH7eKHCedzKhg3xquQAE3SY6BGXoqC6dQCQTSNc=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\vyron\\.ohos\\config\\default_harmony-authenticator_xbIiNH7eKHCedzKhg3xquQAE3SY6BGXoqC6dQCQTSNc=.p12",
+          "storePassword": "0000001B455F4B99CC8930CCA58F682AE7BCC9EEE3A41FCEE312D5168197A45CB5274DAE449337F2C5C0CA"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
-        "signingConfig": "",
+        "signingConfig": "default",
         "compatibleSdkVersion": "6.0.2(22)",
         "compileSdkVersion": "6.1.1(24)",
         "targetSdkVersion": "6.1.1(24)",
